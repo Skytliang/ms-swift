@@ -2088,12 +2088,16 @@ class Template(ProcessorMixin):
             modeling_module._flash_attention_forward = _origin_flash_attention_forward
 
     @staticmethod
-    def _get_inputs_embeds_hf(inputs_embeds, inputs, visual, processor, config):
+    def _get_inputs_embeds_hf(inputs_embeds, inputs, visual, processor, config, memory_model=None):
         input_ids = inputs['input_ids']
         pixel_values = inputs.get('pixel_values')
         pixel_values_videos = inputs.get('pixel_values_videos')
         image_grid_thw = inputs.get('image_grid_thw')
         video_grid_thw = inputs.get('video_grid_thw')
+
+        pixel_values_scaled_videos = inputs.get('pixel_values_scaled_videos')
+        scaled_video_grid_thw = inputs.get('scaled_video_grid_thw')
+
         dtype = visual.dtype
         if pixel_values is None and pixel_values_videos is None:  # plain-text
             images = [Image.new('RGB', (32, 32), (0, 0, 0))]
@@ -2116,6 +2120,15 @@ class Template(ProcessorMixin):
                 grid_thw = torch.concat([image_grid_thw, video_grid_thw], dim=0)
             pixel_values_mixed = pixel_values_mixed.type(dtype)
             mixed_embeds = visual(pixel_values_mixed, grid_thw=grid_thw)
+
+            # Same processing as pixel_values_videos: dtype cast -> visual -> (pooler_output) -> store in inputs
+            scaled_video_embeds = None
+            if pixel_values_scaled_videos is not None and scaled_video_grid_thw is not None:
+                pixel_values_scaled_videos = pixel_values_scaled_videos.type(dtype)
+                scaled_video_embeds = visual(pixel_values_scaled_videos, grid_thw=scaled_video_grid_thw)
+                if hasattr(scaled_video_embeds, 'pooler_output'):
+                    scaled_video_embeds = scaled_video_embeds.pooler_output
+
             if hasattr(mixed_embeds, 'pooler_output'):
                 mixed_embeds = mixed_embeds.pooler_output
             if pixel_values is None:
@@ -2136,12 +2149,38 @@ class Template(ProcessorMixin):
                 image_mask = image_mask.to(inputs_embeds.device)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
+            if scaled_video_embeds is not None:
+                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                scaled_video_embeds = scaled_video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                video_embeds = Template._compress_video_embeds(video_embeds, scaled_video_embeds, memory_model)
+
             if video_embeds is not None:
                 video_mask = (input_ids == config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 video_mask = video_mask.to(inputs_embeds.device)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
         return inputs_embeds
+
+    @staticmethod
+    def _compress_video_embeds(video_embeds, scaled_video_embeds, memory_model):
+        # print(f"base.py - _compress_video_embeds - video_embeds: {video_embeds.shape}\n{video_embeds}")
+        # print(f"base.py - _compress_video_embeds - scaled_video_embeds: {scaled_video_embeds.shape}\n{scaled_video_embeds}")
+        target_len = video_embeds.shape[0]
+        inputs_embeds = torch.concat([scaled_video_embeds, video_embeds], dim=0)
+        seq_len, hidden_size = inputs_embeds.shape
+        inputs_embeds = inputs_embeds.unsqueeze(0)  # (1, seq_len, hidden_size)
+        attention_mask = torch.ones(
+            1, seq_len, dtype=torch.long, device=inputs_embeds.device
+        )
+        outputs = memory_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+        # Take last `target_len` positions as compressed representation -> (720, 2560)
+        last_hidden_state = outputs.last_hidden_state
+        video_embeds = last_hidden_state[0, -target_len:, :]
+        # print(f"base.py - _compress_video_embeds - compressed_video_embeds: {video_embeds.shape}\n{video_embeds}")
+        return video_embeds
 
     @staticmethod
     def _concat_text_position_ids(position_ids):

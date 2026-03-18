@@ -137,6 +137,7 @@ class MLLMModelType:
     qwen_vl = 'qwen_vl'
     qwen_audio = 'qwen_audio'
     qwen2_vl = 'qwen2_vl'
+    memqwen3_5 = 'memqwen3_5'
     qwen2_5_vl = 'qwen2_5_vl'
     qwen2_5_omni = 'qwen2_5_omni'
     qwen3_omni_moe = 'qwen3_omni_moe'

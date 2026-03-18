@@ -308,7 +308,7 @@ class Qwen2VLTemplate(Template):
 
     def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
-        from qwen_vl_utils import fetch_image, fetch_video
+        from qwen_vl_utils import fetch_image, fetch_video, vision_process
         assert media_type in {'image', 'video'}
         kwargs = {'image_patch_size': self.processor.image_processor.patch_size} if self.version == 'v3' else {}
         if media_type == 'image':
@@ -323,8 +323,27 @@ class Qwen2VLTemplate(Template):
             video = inputs.videos[index]
             video_inputs = {'video': video}
             if isinstance(video, list):  # image list
-                from qwen_vl_utils import vision_process
                 video_inputs['sample_fps'] = vision_process.FPS
+
+            # Temporarily override video sampling frames with an env-controlled scale.
+            frames_scale = get_env_args('VIDEO_FRAMES_SCALE', int, None)
+            if frames_scale is not None:
+                scaled_video_inputs = video_inputs.copy()
+                old_min_frames = getattr(vision_process, 'FPS_MIN_FRAMES')
+                old_max_frames = getattr(vision_process, 'FPS_MAX_FRAMES')
+                vision_process.FPS_MIN_FRAMES = frames_scale * old_min_frames
+                vision_process.FPS_MAX_FRAMES = frames_scale * old_max_frames
+                scaled_video, scaled_video_kwargs = fetch_video(
+                    scaled_video_inputs, return_video_sample_fps=True, **kwargs)
+                vision_process.FPS_MIN_FRAMES = old_min_frames
+                vision_process.FPS_MAX_FRAMES = old_max_frames
+                scaled_video, scaled_video_metadata = scaled_video
+                if isinstance(scaled_video, torch.Tensor):
+                    scaled_video = scaled_video.to(torch.uint8)
+                inputs.scaled_videos.append(scaled_video)
+                inputs.scaled_mm_processor_kwargs.setdefault('video_metadata', []).append(scaled_video_metadata)
+                inputs.scaled_mm_processor_kwargs['do_sample_frames'] = False
+
             video, video_kwargs = fetch_video(video_inputs, return_video_sample_fps=True, **kwargs)
             tokens = ['<|vision_start|><|video_pad|><|vision_end|>']
             if self.version == 'v2_5':
@@ -417,7 +436,8 @@ class Qwen2VLTemplate(Template):
             inputs_embeds = base_model.model.embed_tokens(input_ids)
         else:
             inputs_embeds = base_model.model.language_model.embed_tokens(input_ids)
-        inputs_embeds = self._get_inputs_embeds_hf(inputs_embeds, inputs, model.visual, self.processor, model.config)
+        memory_model = getattr(base_model.model, 'memory_model', None)
+        inputs_embeds = self._get_inputs_embeds_hf(inputs_embeds, inputs, model.visual, self.processor, model.config, memory_model)
         return {'inputs_embeds': inputs_embeds}
 
     def _data_collator_mm_data(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -425,6 +445,17 @@ class Qwen2VLTemplate(Template):
         second_per_grid_ts = self.gather_list(batch, 'second_per_grid_ts')
         if second_per_grid_ts:
             res['second_per_grid_ts'] = second_per_grid_ts
+
+        # Collate scaled video features if present
+        pixel_values_scaled_videos = [
+            b['pixel_values_scaled_videos'] for b in batch if b.get('pixel_values_scaled_videos') is not None
+        ]
+        if pixel_values_scaled_videos:
+            res['pixel_values_scaled_videos'] = torch.concat(pixel_values_scaled_videos)
+
+        scaled_video_grid_thw = self.concat_tensor(batch, 'scaled_video_grid_thw', 0)
+        if scaled_video_grid_thw is not None:
+            res['scaled_video_grid_thw'] = scaled_video_grid_thw
         return res
 
     def packing_row(self, row: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -543,6 +574,20 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
                 input_ids, labels, loss_scale = self._extend_tokens(input_ids, labels, loss_scale, idx_list,
                                                                     _get_new_tokens)
                 encoded.update(media_inputs)
+
+        # Process scaled_videos with the same processor flow -> pixel_values_scaled_videos, scaled_video_grid_thw
+        if getattr(inputs, 'scaled_videos', None):
+            scaled_mm_data = inputs.scaled_videos
+            scaled_media_inputs = processor(
+                text=['\n'.join(['<|vision_start|><|video_pad|><|vision_end|>'] * len(scaled_mm_data))],
+                videos=scaled_mm_data,
+                return_tensors='pt',
+                do_resize=False,
+                **getattr(inputs, 'scaled_mm_processor_kwargs', {}))
+            scaled_media_inputs.pop('input_ids', None)
+            scaled_media_inputs.pop('attention_mask', None)
+            encoded['pixel_values_scaled_videos'] = scaled_media_inputs['pixel_values_videos']
+            encoded['scaled_video_grid_thw'] = scaled_media_inputs['video_grid_thw']
 
         encoded['input_ids'] = input_ids
         encoded['labels'] = labels

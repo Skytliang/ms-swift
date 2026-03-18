@@ -26,6 +26,8 @@ class StdTemplateInputs:
     videos: List[str] = field(default_factory=list)
     audios: List[str] = field(default_factory=list)
     objects: Dict[str, Any] = field(default_factory=dict)
+    scaled_videos: List[str] = field(default_factory=list)
+    scaled_mm_processor_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     margin: Optional[float] = None  # for reward modeling
     mm_processor_kwargs: Dict[str, Any] = field(default_factory=dict)

@@ -1190,6 +1190,35 @@ register_model(
         tags=['vision', 'video']))
 
 
+class MemQwen3_5Loader(Qwen3VLLoader):
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        from ..modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+        self.auto_model_cls = self.auto_model_cls or Qwen3_5ForConditionalGeneration
+        return Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.memqwen3_5,
+        [
+            ModelGroup(
+                [
+                    Model('Qwen/MemQwen3.5-0.8B', 'Qwen/MemQwen3.5-0.8B'),
+                    Model('Qwen/MemQwen3.5-2B', 'Qwen/MemQwen3.5-2B'),
+                    Model('Qwen/MemQwen3.5-4B', 'Qwen/MemQwen3.5-4B'),
+                    Model('Qwen/MemQwen3.5-9B', 'Qwen/MemQwen3.5-9B'),
+                    Model('Qwen/MemQwen3.5-27B', 'Qwen/MemQwen3.5-27B'),
+                ],
+                TemplateType.qwen3_5),
+        ],
+        MemQwen3_5Loader,
+        model_arch=ModelArch.mem_qwen3_5,
+        architectures=['Qwen3_5ForConditionalGeneration'],
+        requires=['transformers>=5.0.0.dev', 'qwen_vl_utils>=0.0.14', 'decord'],
+        tags=['vision', 'video']))
+
+
 class Qwen2_5OmniLoader(ModelLoader):
 
     def _check_qwen_omni_utils(self):

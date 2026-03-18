@@ -64,6 +64,12 @@ else:
 
 logger = logging.get_logger(__name__)
 
+import os
+import torch.distributed as dist
+is_master = (os.environ.get("RANK") in (None, "0")) or (
+    dist.is_available() and dist.is_initialized() and dist.get_rank() == 0
+)
+
 
 class Qwen3_5DynamicCache:
     """
@@ -1413,6 +1419,9 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         self.language_model = Qwen3_5TextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
 
+        self.memory_model = Qwen3_5TextModel._from_config(config.text_config)
+        self.memory_embedding = nn.Embedding(config.text_config.memory_vocab_size, config.text_config.hidden_size)
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1594,6 +1603,26 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             )
         return special_image_mask, special_video_mask
 
+    def _compress_video_embeds(
+        self,
+        video_embeds: torch.Tensor,
+        scaled_video_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match Template._compress_video_embeds: concat scaled + video, run memory_model once, keep last video_len tokens."""
+        # print(f"modeling_qwen3_5.py - _compress_video_embeds - video_embeds: {video_embeds.shape}\n{video_embeds}")
+        # print(f"modeling_qwen3_5.py - _compress_video_embeds - scaled_video_embeds: {scaled_video_embeds.shape}\n{scaled_video_embeds}")
+        target_len = video_embeds.shape[0]
+        inputs_embeds = torch.cat([scaled_video_embeds, video_embeds], dim=0)
+        seq_len, _ = inputs_embeds.shape
+        inputs_embeds = inputs_embeds.unsqueeze(0)  # (1, seq_len, hidden_size)
+        attention_mask = torch.ones(1, seq_len, dtype=torch.long, device=inputs_embeds.device)
+        outputs = self.memory_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        last_hidden_state = outputs.last_hidden_state
+        video_embeds = last_hidden_state[0, -target_len:, :]
+        # print(f"modeling_qwen3_5.py - _compress_video_embeds - compressed_video_embeds: {video_embeds.shape}\n{video_embeds}")
+        # exit()
+        return video_embeds.to(video_embeds.device, video_embeds.dtype)
+
     def compute_3d_position_ids(
         self,
         input_ids: torch.Tensor | None,
@@ -1642,8 +1671,10 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         inputs_embeds: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.FloatTensor | None = None,
+        pixel_values_scaled_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
+        scaled_video_grid_thw: torch.LongTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5ModelOutputWithPast:
@@ -1679,6 +1710,20 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
+            if (
+                pixel_values_scaled_videos is not None
+                and scaled_video_grid_thw is not None
+                and hasattr(self, "memory_model")
+                and self.memory_model is not None
+            ):
+                scaled_video_outputs: BaseModelOutputWithPooling = self.get_video_features(
+                    pixel_values_scaled_videos, scaled_video_grid_thw, return_dict=True
+                )
+                scaled_video_embeds = scaled_video_outputs.pooler_output
+                scaled_video_embeds = torch.cat(
+                    scaled_video_embeds, dim=0
+                ).to(inputs_embeds.device, inputs_embeds.dtype)
+                video_embeds = self._compress_video_embeds(video_embeds, scaled_video_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         if position_ids is None:
@@ -1979,8 +2024,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         use_cache=True,
         pixel_values=None,
         pixel_values_videos=None,
+        pixel_values_scaled_videos=None,
         image_grid_thw=None,
         video_grid_thw=None,
+        scaled_video_grid_thw=None,
         is_first_iteration=False,
         **kwargs,
     ):
@@ -1995,8 +2042,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
+            pixel_values_scaled_videos=pixel_values_scaled_videos,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
+            scaled_video_grid_thw=scaled_video_grid_thw,
             use_cache=use_cache,
             is_first_iteration=is_first_iteration,
             **kwargs,
@@ -2005,6 +2054,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if not is_first_iteration and use_cache:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
+            model_inputs["pixel_values_scaled_videos"] = None
+            model_inputs["scaled_video_grid_thw"] = None
 
         return model_inputs
 
@@ -2111,7 +2162,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         if expand_size == 1:
             return input_ids, model_kwargs
 
-        visual_keys = ["pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"]
+        visual_keys = [
+            "pixel_values",
+            "image_grid_thw",
+            "pixel_values_videos",
+            "video_grid_thw",
+            "pixel_values_scaled_videos",
+            "scaled_video_grid_thw",
+        ]
 
         def _expand_dict_for_generation_visual(dict_to_expand):
             image_grid_thw = model_kwargs.get("image_grid_thw", None)
@@ -2159,6 +2217,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                         dict_to_expand[key], lengths=lengths, repeat_times=expand_size
                     )
                 elif key == "video_grid_thw":
+                    lengths = list(video_nums)
+                    dict_to_expand[key] = _repeat_interleave_samples(
+                        dict_to_expand[key], lengths=lengths, repeat_times=expand_size
+                    )
+                elif key == "pixel_values_scaled_videos":
+                    scaled_video_grid_thw = model_kwargs.get("scaled_video_grid_thw", None)
+                    if scaled_video_grid_thw is not None:
+                        samples = torch.split(scaled_video_grid_thw, list(video_nums))
+                        lengths = [torch.prod(sample, dim=1).sum() for sample in samples]
+                        dict_to_expand[key] = _repeat_interleave_samples(
+                            dict_to_expand[key], lengths=lengths, repeat_times=expand_size
+                        )
+                elif key == "scaled_video_grid_thw":
                     lengths = list(video_nums)
                     dict_to_expand[key] = _repeat_interleave_samples(
                         dict_to_expand[key], lengths=lengths, repeat_times=expand_size
