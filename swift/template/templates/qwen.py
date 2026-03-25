@@ -344,7 +344,27 @@ class Qwen2VLTemplate(Template):
                 inputs.scaled_mm_processor_kwargs.setdefault('video_metadata', []).append(scaled_video_metadata)
                 inputs.scaled_mm_processor_kwargs['do_sample_frames'] = False
 
-            video, video_kwargs = fetch_video(video_inputs, return_video_sample_fps=True, **kwargs)
+                # Derive the normal (unscaled) video by uniformly subsampling the already-decoded
+                # scaled frames, avoiding a redundant full video decode from disk.
+                # NOTE: Cannot use a fixed stride [::frames_scale] because for short videos
+                # scaled_video may have fewer than (frames_scale * old_max_frames) frames
+                # (e.g. FPS_MAX=16, scale=32 wants 512 frames but video only has 270).
+                # Use linspace to always get exactly min(old_max_frames, scaled_len) frames.
+                scaled_len = scaled_video.shape[0]
+                normal_num_frames = max(1, min(old_max_frames, scaled_len))
+                normal_indices = torch.linspace(0, scaled_len - 1, normal_num_frames).long()
+                normal_frames = scaled_video[normal_indices]
+                scaled_frames_indices = scaled_video_metadata.get('frames_indices')
+                if scaled_frames_indices is not None:
+                    scaled_frames_indices_tensor = torch.as_tensor(scaled_frames_indices)
+                    normal_frames_indices = scaled_frames_indices_tensor[normal_indices].tolist()
+                else:
+                    normal_frames_indices = None
+                normal_video_metadata = dict(scaled_video_metadata, frames_indices=normal_frames_indices)
+                video = (normal_frames, normal_video_metadata)
+                video_kwargs = scaled_video_kwargs / frames_scale
+            else:
+                video, video_kwargs = fetch_video(video_inputs, return_video_sample_fps=True, **kwargs)
             tokens = ['<|vision_start|><|video_pad|><|vision_end|>']
             if self.version == 'v2_5':
                 inputs.mm_processor_kwargs.setdefault('fps', []).append(video_kwargs)
