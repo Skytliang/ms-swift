@@ -210,13 +210,20 @@ def get_multimodal_target_regex(
     freeze_llm: bool = False,
     freeze_vit: bool = True,
     freeze_aligner: bool = True,
+    freeze_memory_model: bool = False,
+    freeze_language_model: bool = False,
     include_embedding: bool = False,
     exclude_router: bool = False,
 ) -> str:
     model_arch = model.model_meta.model_arch
     modules = []
     if not freeze_llm:
-        modules += model_arch.language_model
+        llm_modules = model_arch.language_model
+        if freeze_memory_model:
+            llm_modules = [m for m in llm_modules if 'memory_model' not in m]
+        if freeze_language_model:
+            llm_modules = [m for m in llm_modules if 'language_model' not in m]
+        modules += llm_modules
     if not freeze_vit:
         modules += model_arch.vision_tower
     if not freeze_aligner:

@@ -98,6 +98,8 @@ def get_target_modules(args, model) -> Union[str, List[str]]:
                 freeze_llm=args.freeze_llm,
                 freeze_vit=args.freeze_vit,
                 freeze_aligner=args.freeze_aligner,
+                freeze_memory_model=args.freeze_memory_model,
+                freeze_language_model=args.freeze_language_model,
                 include_embedding='all-embedding' in target_modules)
         else:
             target_modules.remove('all-linear')
