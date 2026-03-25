@@ -1213,7 +1213,7 @@ register_model(
                 TemplateType.qwen3_5),
         ],
         MemQwen3_5Loader,
-        model_arch=ModelArch.mem_qwen3_5,
+        model_arch=ModelArch.memqwen3_5,
         architectures=['Qwen3_5ForConditionalGeneration'],
         requires=['transformers>=5.0.0.dev', 'qwen_vl_utils>=0.0.14', 'decord'],
         tags=['vision', 'video']))
