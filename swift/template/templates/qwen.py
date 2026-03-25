@@ -355,11 +355,8 @@ class Qwen2VLTemplate(Template):
                 normal_indices = torch.linspace(0, scaled_len - 1, normal_num_frames).long()
                 normal_frames = scaled_video[normal_indices]
                 scaled_frames_indices = scaled_video_metadata.get('frames_indices')
-                if scaled_frames_indices is not None:
-                    scaled_frames_indices_tensor = torch.as_tensor(scaled_frames_indices)
-                    normal_frames_indices = scaled_frames_indices_tensor[normal_indices].tolist()
-                else:
-                    normal_frames_indices = None
+                scaled_frames_indices_tensor = torch.as_tensor(scaled_frames_indices)
+                normal_frames_indices = scaled_frames_indices_tensor[normal_indices].tolist()
                 normal_video_metadata = dict(scaled_video_metadata, frames_indices=normal_frames_indices)
                 video = (normal_frames, normal_video_metadata)
                 video_kwargs = scaled_video_kwargs / frames_scale
