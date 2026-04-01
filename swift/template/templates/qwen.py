@@ -60,6 +60,120 @@ class Qwen3MixedTemplateMeta(QwenTemplateMeta):
 
 register_template(Qwen3MixedTemplateMeta(LLMTemplateType.qwen3, is_thinking=True))
 
+
+class MemQwen3Template(Template):
+    """Template for MemQwen3ForCausalLM.
+
+    Expected dataset format (one sample):
+        {
+            "messages": [
+                {"role": "user", "content": "<chunk><chunk>两段文字有什么区别"}
+            ],
+            "chunks": ["小猫小猫，我是小猫", "小狗小狗，我是小狗"]
+        }
+
+    Each ``<chunk>`` tag in the message content corresponds to one entry in the
+    ``chunks`` list.  During ``_pre_tokenize`` it is replaced by a single pad-id
+    placeholder token, which ``_encode`` then expands to ``memory_vocab_size``
+    pad-id tokens (the memory slots).  ``memory_mask`` marks those positions and
+    ``chunk_input_ids`` carries the tokenised chunk texts; both are consumed by the
+    model's ``forward``.
+    """
+
+    # Subclasses of Template that need to call replace_tag for a new media type
+    # must declare it in special_tokens (done in base.py) and implement it here.
+
+    def replace_tag(self, media_type: str, index: int,
+                    inputs: StdTemplateInputs) -> List[Context]:
+        """Return a single pad-id placeholder for each ``<chunk>`` occurrence."""
+        if media_type == 'chunk':
+            pad_id = self.tokenizer.pad_token_id
+            return [[pad_id]]          # one-token placeholder (list[token_ids])
+        return super().replace_tag(media_type, index, inputs)
+
+    def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+        encoded = Template._encode(self, inputs)
+        if not inputs.chunks:
+            return encoded
+
+        tokenizer = self.tokenizer
+        memory_vocab_size: Optional[int] = getattr(self.config, 'memory_vocab_size', None)
+        if memory_vocab_size is None:
+            return encoded
+
+        pad_id = tokenizer.pad_token_id
+
+        # ── tokenise each chunk text ──────────────────────────────────────
+        vocab_size: int = self.config.vocab_size
+        mem_slot_ids: List[int] = list(range(vocab_size, vocab_size + memory_vocab_size))
+        chunk_token_lists: List[List[int]] = [
+            # This pad-id is the separator between text and memory slots
+            tokenizer.encode(text, add_special_tokens=False) + [pad_id] + mem_slot_ids
+            for text in inputs.chunks
+        ]
+        num_chunks = len(chunk_token_lists)
+
+        # ── expand pad-id placeholders → memory_vocab_size slots each ─────
+        input_ids: List[int] = encoded['input_ids']
+        labels: Optional[List[int]] = encoded.get('labels')
+        loss_scale: Optional[List[float]] = encoded.get('loss_scale')
+
+        new_input_ids:   List[int]  = []
+        new_labels:      Optional[List[int]]  = [] if labels is not None else None
+        new_loss_scale              = [] if loss_scale is not None else None
+        new_memory_mask: List[bool] = []
+
+        chunk_counter = 0
+        i = 0
+        while i < len(input_ids):
+            tok = input_ids[i]
+            if tok == pad_id and chunk_counter < num_chunks:
+                # This pad-id was inserted by replace_tag as a chunk placeholder.
+                # Expand to memory_vocab_size memory-slot positions.
+                new_input_ids.extend([pad_id] * memory_vocab_size)
+                if new_labels is not None:
+                    new_labels.extend([-100] * memory_vocab_size)
+                new_memory_mask.extend([True] * memory_vocab_size)
+                if new_loss_scale is not None:
+                    new_loss_scale.extend([0.0] * memory_vocab_size)
+                chunk_counter += 1
+            else:
+                new_input_ids.append(tok)
+                if new_labels is not None:
+                    new_labels.append(labels[i])
+                new_memory_mask.append(False)
+                if new_loss_scale is not None:
+                    new_loss_scale.append(loss_scale[i])
+            i += 1
+
+        encoded['input_ids']   = new_input_ids
+        encoded['labels']      = new_labels
+        encoded['memory_mask'] = torch.tensor(new_memory_mask, dtype=torch.bool)
+        if new_loss_scale is not None:
+            encoded['loss_scale'] = new_loss_scale
+
+        # ── store tokenised chunks as (num_chunks, text_len+1+M) tensor ─────
+        # Layout per chunk: [text_tokens, sep_pad, mem_slot_0, ..., mem_slot_M-1]
+        max_len = max(len(ids) for ids in chunk_token_lists)
+        chunk_ids        = torch.full((num_chunks, max_len), pad_id, dtype=torch.long)
+        chunk_mask       = torch.zeros(num_chunks, max_len, dtype=torch.long)
+        chunk_memory_mask = torch.zeros(num_chunks, max_len, dtype=torch.bool)
+        for j, ids in enumerate(chunk_token_lists):
+            chunk_ids[j, :len(ids)]           = torch.tensor(ids, dtype=torch.long)
+            chunk_mask[j, :len(ids)]          = 1
+            # last M positions are mem_slots
+            chunk_memory_mask[j, len(ids) - memory_vocab_size:len(ids)] = True
+
+        encoded['chunk_input_ids']       = chunk_ids          # (NC, max_len)
+        encoded['chunk_attention_mask']  = chunk_mask         # (NC, max_len)
+        encoded['chunk_memory_mask']     = chunk_memory_mask  # (NC, max_len) True = mem_slot
+        return encoded
+
+
+register_template(Qwen3MixedTemplateMeta(LLMTemplateType.memqwen3, is_thinking=False,
+                                         non_thinking_prefix='',
+                                         template_cls=MemQwen3Template))
+
 QWEN3_GUARD_TEMPLATE = (
     '<|im_start|>user\n'
     "# Task:\n1) Evaluate whether THE LAST USER's query belongs to safe or unsafe content based on our "

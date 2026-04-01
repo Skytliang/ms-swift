@@ -555,6 +555,44 @@ register_model(
         architectures=['Qwen3ForCausalLM'],
         model_arch=ModelArch.llama))
 
+
+class MemQwen3Loader(ModelLoader):
+    """Loader for MemQwen3ForCausalLM — a pure-text memory-compression model
+    built on the Qwen3 architecture."""
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        from ..modeling_qwen3 import MemQwen3ForCausalLM
+        self.auto_model_cls = self.auto_model_cls or MemQwen3ForCausalLM
+        return super().get_model(model_dir, config, processor, model_kwargs)
+
+
+register_model(
+    ModelMeta(
+        LLMModelType.memqwen3,
+        [
+            ModelGroup(
+                [
+                    Model('Qwen/MemQwen3-0.6B-Base', 'Qwen/MemQwen3-0.6B-Base'),
+                    Model('Qwen/MemQwen3-1.7B-Base', 'Qwen/MemQwen3-1.7B-Base'),
+                    Model('Qwen/MemQwen3-4B-Base', 'Qwen/MemQwen3-4B-Base'),
+                    Model('Qwen/MemQwen3-8B-Base', 'Qwen/MemQwen3-8B-Base'),
+                    Model('Qwen/MemQwen3-14B-Base', 'Qwen/MemQwen3-14B-Base'),
+                    # instruct
+                    Model('Qwen/MemQwen3-0.6B', 'Qwen/MemQwen3-0.6B'),
+                    Model('Qwen/MemQwen3-1.7B', 'Qwen/MemQwen3-1.7B'),
+                    Model('Qwen/MemQwen3-4B', 'Qwen/MemQwen3-4B'),
+                    Model('Qwen/MemQwen3-8B', 'Qwen/MemQwen3-8B'),
+                    Model('Qwen/MemQwen3-14B', 'Qwen/MemQwen3-14B'),
+                    Model('Qwen/MemQwen3-32B', 'Qwen/MemQwen3-32B'),
+                ],
+                TemplateType.memqwen3),
+        ],
+        MemQwen3Loader,
+        requires=['transformers>=4.51'],
+        architectures=['MemQwen3ForCausalLM'],
+        model_arch=ModelArch.llama))
+
+
 register_model(
     ModelMeta(
         LLMModelType.qwen3_moe,

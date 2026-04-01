@@ -52,8 +52,8 @@ class Template(ProcessorMixin):
     - Various inference engines (Transformers, vLLM, LMDeploy, SGLang)
     - Advanced features like padding-free training, sequence parallelism, and loss scaling
     """
-    special_tokens = ['<image>', '<video>', '<audio>', '<bbox>', '<ref-object>', '<cot-process>', '<start-image>']
-    special_keys = ['images', 'videos', 'audios', 'objects']
+    special_tokens = ['<image>', '<video>', '<audio>', '<bbox>', '<ref-object>', '<cot-process>', '<start-image>', '<chunk>']
+    special_keys = ['images', 'videos', 'audios', 'objects', 'chunks']
 
     image_placeholder = ['<image>']
     video_placeholder = ['<video>']
@@ -907,12 +907,12 @@ class Template(ProcessorMixin):
         res_loss_scale: List[float] = []  # result of loss_scale_list
 
         # reset
-        for k in ['video', 'audio', 'object', 'box']:
+        for k in ['video', 'audio', 'object', 'box', 'chunk']:
             setattr(inputs, f'{k}_idx', 0)
 
         for context, loss_scale in zip(context_list, loss_scale_list):
-            for k in ['video', 'audio']:
-                if context == f'<{k}>' and inputs.is_multimodal and getattr(inputs, f'{k}_idx') < len(
+            for k in ['video', 'audio', 'chunk']:
+                if context == f'<{k}>' and getattr(inputs, f'{k}s', None) and getattr(inputs, f'{k}_idx') < len(
                         getattr(inputs, f'{k}s')):
                     c_list = self.replace_tag(k, getattr(inputs, f'{k}_idx'), inputs)
                     setattr(inputs, f'{k}_idx', getattr(inputs, f'{k}_idx') + 1)
@@ -952,7 +952,7 @@ class Template(ProcessorMixin):
         total_content = '\n'.join(total_content)
         if inputs.system:
             total_content = f'{inputs.system}\n{total_content}'
-        for media_type in ['image', 'audio', 'video']:
+        for media_type in ['image', 'audio', 'video', 'chunk']:
             media_key, media_tag = f'{media_type}s', f'<{media_type}>'
             medias = getattr(inputs, media_key)
             if not isinstance(medias, list):
@@ -1725,7 +1725,7 @@ class Template(ProcessorMixin):
         res = {}
         if self.padding_free:
             assert len(batch) == 1, f'batch: {batch}'
-            for k in ['input_ids', 'labels', 'position_ids', 'loss_scale', 'channel']:
+            for k in ['input_ids', 'labels', 'position_ids', 'loss_scale', 'channel', 'memory_mask']:
                 v = batch[0].get(k)
                 if v is not None:
                     res[k] = v if k == 'channel' else [v]
@@ -1741,7 +1741,7 @@ class Template(ProcessorMixin):
             if any(channel):
                 res['channel'] = channel
 
-            for key in ['labels', 'loss_scale', 'position_ids', 'token_type_ids']:
+            for key in ['labels', 'loss_scale', 'position_ids', 'token_type_ids', 'memory_mask']:
                 val = [b[key] for b in batch if b.get(key) is not None]
                 if val:
                     res[key] = val
@@ -1755,8 +1755,9 @@ class Template(ProcessorMixin):
             'position_ids',
             'token_type_ids',
             'attention_mask_2d',
+            'memory_mask',
         ]
-        pad_values = [self.tokenizer.pad_token_id, 0., 0, -100, 0., 0., 0, 0]
+        pad_values = [self.tokenizer.pad_token_id, 0., 0, -100, 0., 0., 0, 0, False]
         # Convert to tensor and remove unnecessary dimensions.
         seq_lens = None
         for key in keys:
@@ -1874,6 +1875,25 @@ class Template(ProcessorMixin):
             grid_thw = self.concat_tensor(batch, f'{media_type}_grid_thw', 0)
             if grid_thw is not None:
                 res[f'{media_type}_grid_thw'] = grid_thw
+
+        # --- text-memory chunk compression ---
+        # chunk_input_ids: (NC, text_len+1+M) per sample, already padded within
+        # each sample by the template. Here we just add the batch dimension.
+        # TODO: support batch_size > 1 (cross-sample padding).
+        chunk_input_ids_list = [b['chunk_input_ids'] for b in batch if b.get('chunk_input_ids') is not None]
+        if len(chunk_input_ids_list) > 0:
+            assert len(chunk_input_ids_list) == len(batch) == 1, (
+                "chunk_input_ids only supports batch_size=1 for now."
+            )
+            chunk_attn_mask_list = [b.get('chunk_attention_mask') for b in batch]
+
+            res['chunk_input_ids'] = chunk_input_ids_list[0]   # (NC, C)
+            if chunk_attn_mask_list[0] is not None:
+                res['chunk_attention_mask'] = chunk_attn_mask_list[0]   # (NC, C)
+            chunk_memory_mask = batch[0].get('chunk_memory_mask')
+            if chunk_memory_mask is not None:
+                res['chunk_memory_mask'] = chunk_memory_mask            # (NC, C)
+
         return res
 
     def _sp_data_collator(self, res, padding_to, tokenizer, padding_side):

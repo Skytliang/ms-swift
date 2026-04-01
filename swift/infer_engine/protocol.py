@@ -47,6 +47,10 @@ class InferRequest:
         audios (List[str]):
             Optional, a list of audio resources associated with the request.
 
+        chunks (List[str]):
+            Optional, a list of text chunks for memory compression (MemQwen3).
+            Each chunk will be encoded by the memory_model and injected at <chunk> positions.
+
         videos (List[str]):
             Optional, a list of video resources associated with the request.
 
@@ -62,12 +66,13 @@ class InferRequest:
     images: List[Union[str, Image.Image]] = field(default_factory=list)
     audios: List[str] = field(default_factory=list)
     videos: List[str] = field(default_factory=list)
+    chunks: List[str] = field(default_factory=list)
 
     tools: Optional[List[Tool]] = None
     objects: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
-        for key in ['images', 'audios', 'videos']:
+        for key in ['images', 'audios', 'videos', 'chunks']:
             val = getattr(self, key)
             if isinstance(val, str):
                 setattr(self, key, [val])

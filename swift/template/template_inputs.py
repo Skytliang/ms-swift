@@ -25,6 +25,7 @@ class StdTemplateInputs:
     images: List[Union[str, Image.Image]] = field(default_factory=list)
     videos: List[str] = field(default_factory=list)
     audios: List[str] = field(default_factory=list)
+    chunks: List[str] = field(default_factory=list)
     objects: Dict[str, Any] = field(default_factory=dict)
     scaled_videos: List[str] = field(default_factory=list)
     scaled_mm_processor_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -37,6 +38,7 @@ class StdTemplateInputs:
         self.image_idx = 0
         self.audio_idx = 0
         self.video_idx = 0
+        self.chunk_idx = 0
         self.ref_idx = 0
         self.bbox_idx = 0
         if self.images and not isinstance(self.images, (list, tuple)):
@@ -93,11 +95,13 @@ class StdTemplateInputs:
 
         all_keys = set(f.name for f in fields(StdTemplateInputs))
         extra_kwargs = {k: v for k, v in inputs.items() if k not in all_keys}
+        chunks = inputs.get('chunks') or []
         return cls(
             messages=messages,
             system=system,
             tools=tools,
             objects=objects,
+            chunks=chunks,
             extra_kwargs=extra_kwargs,
             **kwargs,
             **media_kwargs)

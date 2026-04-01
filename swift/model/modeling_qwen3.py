@@ -43,7 +43,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
-from configuration_qwen3 import Qwen3Config
+from .configuration_qwen3 import Qwen3Config
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -532,6 +532,250 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
+class MemQwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
+    """
+    Qwen3 for Causal LM with a memory compression module.
+
+    New components vs. vanilla Qwen3ForCausalLM:
+      - ``memory_model`` : a second Qwen3Model used only for compression.
+                           Its ``embed_tokens`` table is **extended** by
+                           ``memory_vocab_size`` extra rows (the memory slots),
+                           so that memory-slot token ids
+                           ``[vocab_size, vocab_size + memory_vocab_size)``
+                           are directly embeddable via the same layer.
+                           This avoids constructing a separate ``memory_embedding``
+                           and the repeated ``arange / expand / cat`` in every
+                           forward pass.
+
+    Text compression flow (called once per forward when ``chunk_input_ids`` is given):
+      For each chunk of ``chunk_size`` tokens in ``chunk_input_ids``:
+        1. Append ``memory_vocab_size`` memory-slot ids to the chunk ids
+        2. Embed the extended ids with memory_model.embed_tokens (one call)
+        3. Run through ``memory_model``
+        4. Keep only the last ``memory_vocab_size`` hidden states
+           → compressed representation of that chunk
+      All compressed chunk representations are concatenated and injected at
+      the positions of ``memory_token_id`` placeholders inside ``input_ids``.
+    """
+
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = Qwen3Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Memory compression components.
+        # memory_model.embed_tokens is expanded to vocab_size + memory_vocab_size
+        # rows at init time (or loaded from checkpoint with the expanded weight).
+        self.memory_model = Qwen3Model(config)
+        self.memory_vocab_size: int = config.memory_vocab_size
+        self._expand_memory_embed_tokens()
+
+        # Pre-build the memory-slot id tensor once; it never changes.
+        # Stored as a buffer so it follows .to(device) automatically.
+        mem_slot_ids = torch.arange(
+            self.vocab_size,
+            self.vocab_size + self.memory_vocab_size,
+            dtype=torch.long,
+        )                                                # (M,)
+        self.register_buffer("_mem_slot_ids", mem_slot_ids, persistent=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def _expand_memory_embed_tokens(self) -> None:
+        """Expand memory_model.embed_tokens from vocab_size to vocab_size + memory_vocab_size rows.
+
+        Called in __init__ before checkpoint weights are loaded, so that the
+        embedding table has the right shape to receive the weights from the
+        checkpoint built by replace_weight_qwen3.py.
+
+        If the embedding is already the right size (e.g. re-entrant __init__),
+        this is a no-op.
+        """
+        emb = self.memory_model.embed_tokens
+        target_rows = self.vocab_size + self.memory_vocab_size
+        if emb.num_embeddings == target_rows:
+            return  # already correct size
+
+        new_emb = nn.Embedding(target_rows, emb.embedding_dim, padding_idx=emb.padding_idx)
+        # Copy existing rows; extra rows will be overwritten by checkpoint load.
+        with torch.no_grad():
+            new_emb.weight[:emb.num_embeddings] = emb.weight
+        self.memory_model.embed_tokens = new_emb
+
+    # ------------------------------------------------------------------
+    # Core compression helper
+    # ------------------------------------------------------------------
+
+    def _compress_chunk_embeds(
+        self,
+        chunk_input_ids: torch.Tensor,        # (NC, C)
+        chunk_attention_mask: torch.Tensor,   # (NC, C)
+        chunk_memory_mask: torch.Tensor,      # (NC, C) bool, True = mem_slot position
+    ) -> torch.Tensor:
+        """
+        Compress token-id sequences chunk-by-chunk using memory_model.
+
+        ``chunk_input_ids`` shape is ``(NC, C)`` where NC is the number of chunks
+        and C = text_len + 1 (sep) + M (mem_slots).  NC is used directly as the
+        batch dimension of memory_model — no extra reshape needed.
+
+        ``chunk_memory_mask`` is produced by the template and marks exactly the
+        M memory-slot positions per chunk — no dynamic index computation needed.
+
+        Returns:
+            compressed: ``(1, NC * M, hidden_size)``  — ready for masked_scatter
+        """
+        NC, C = chunk_input_ids.shape
+        M = self.memory_vocab_size
+
+        # ── memory_model forward (embed + transformer in one call) ────────
+        outputs = self.memory_model(
+            input_ids=chunk_input_ids,
+            attention_mask=chunk_attention_mask,
+        )
+        last_hidden = outputs.last_hidden_state                      # (NC, C, H)
+        H = last_hidden.shape[-1]
+
+        # ── select mem-slot hidden states using chunk_memory_mask ─────────
+        # chunk_memory_mask is True at exactly the M mem-slot positions per chunk.
+        # last_hidden[chunk_memory_mask] gives a flat (NC*M, H) tensor;
+        # reshape to (NC, M, H) then flatten to (1, NC*M, H).
+        compressed = last_hidden[chunk_memory_mask.to(last_hidden.device)].reshape(NC, M, H)  # (NC, M, H)
+        compressed = compressed.reshape(1, NC * M, H)                  # (1, NC*M, H)
+        return compressed.to(dtype=last_hidden.dtype)
+
+    # ------------------------------------------------------------------
+    # Inject compressed doc embeddings at memory-token placeholder positions
+    # ------------------------------------------------------------------
+
+    def _inject_memory_embeddings(
+        self,
+        input_ids: torch.LongTensor,                        # (1, S)
+        memory_mask: torch.BoolTensor,                      # (1, S)
+        chunk_input_ids: torch.LongTensor,                  # (NC, C)
+        chunk_attention_mask: torch.Tensor | None = None,   # (NC, C)
+        chunk_memory_mask: torch.BoolTensor | None = None,  # (NC, C) True = mem_slot
+    ) -> torch.Tensor:
+        """
+        Replace every memory-slot position (marked by ``memory_mask``) in
+        ``input_ids`` with the compressed representation of ``chunk_input_ids``.
+
+        ``memory_mask`` is produced by the template's ``_encode`` and padded by
+        the collator — no ``memory_token_id`` comparison needed here.
+
+        Returns:
+            inputs_embeds: ``(B, S, H)``
+        """
+        embed_layer = self.model.embed_tokens
+
+        # 1. Build base embeddings; memory-slot positions hold pad → harmless
+        inputs_embeds = embed_layer(input_ids)                             # (B, S, H)
+
+        # 2. Compress chunks using memory_model
+        compressed = self._compress_chunk_embeds(
+            chunk_input_ids, chunk_attention_mask, chunk_memory_mask
+        )                                                                  # (1, NC*M, H)
+
+        # 3. Scatter into memory-slot positions via masked_scatter
+        scatter_mask  = memory_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        inputs_embeds = inputs_embeds.masked_scatter(
+            scatter_mask, compressed.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        )
+        return inputs_embeds
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        memory_mask: torch.BoolTensor | None = None,
+        chunk_input_ids: torch.LongTensor | None = None,
+        chunk_attention_mask: torch.Tensor | None = None,
+        chunk_memory_mask: torch.BoolTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> CausalLMOutputWithPast:
+        """
+        memory_mask (`torch.BoolTensor` of shape `(batch_size, seq_len)`, *optional*):
+            True at positions that are memory-slot placeholders (produced by the
+            template and padded by the collator).  Required when ``chunk_input_ids``
+            is provided.
+        chunk_input_ids (`torch.LongTensor` of shape `(NC, C)`, *optional*):
+            Pre-chunked document token ids including mem-slot ids at the end.
+        chunk_attention_mask (`torch.Tensor` of shape `(NC, C)`, *optional*):
+            1 for real tokens, 0 for padding within ``chunk_input_ids``.
+        chunk_memory_mask (`torch.BoolTensor` of shape `(NC, C)`, *optional*):
+            True at the M memory-slot positions per chunk (produced by the template).
+        """
+        # print(f"input_ids: {input_ids.shape}\n{input_ids}")
+        # print(f"memory_mask: {memory_mask.shape}\n{memory_mask}")
+        # print(f"chunk_input_ids: {chunk_input_ids.shape}\n{chunk_input_ids}")
+        # print(f"chunk_attention_mask: {chunk_attention_mask.shape}\n{chunk_attention_mask}")
+        # print(f"chunk_memory_mask: {chunk_memory_mask.shape}\n{chunk_memory_mask}")
+        # print("-"*100)
+        # print(chunk_input_ids[0])
+        # print(chunk_attention_mask[0])
+        # print(chunk_memory_mask[0])
+        # print("-"*100)
+        # for chunk_input_id in chunk_input_ids:
+        #     print(chunk_input_id.tolist())
+        # exit()
+        # ---- optional memory compression ----
+        # Only inject during the prefill step (input_ids length matches memory_mask).
+        # During KV-cache generation steps input_ids is (B, 1) — skip injection.
+        if (memory_mask is not None and chunk_input_ids is not None
+                and input_ids is not None
+                and input_ids.shape[1] == memory_mask.shape[1]):
+            inputs_embeds = self._inject_memory_embeddings(
+                input_ids, memory_mask, chunk_input_ids,
+                chunk_attention_mask, chunk_memory_mask
+            )
+            input_ids = None
+
+        # ---- main LM forward ----
+        outputs: BaseModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
     pass
 
@@ -546,6 +790,7 @@ class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedMode
 
 __all__ = [
     "Qwen3ForCausalLM",
+    "MemQwen3ForCausalLM",
     "Qwen3ForQuestionAnswering",
     "Qwen3PreTrainedModel",
     "Qwen3Model",
