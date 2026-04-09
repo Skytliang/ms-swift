@@ -146,8 +146,6 @@ For guidance on selecting parallelization strategies, please refer to the [Train
 - 🔥decoder_first_pipeline_num_layers: The number of Transformer layers in the first pipeline stage of the decoder. Default is None, which means the Transformer layers are evenly distributed across all pipeline stages.
   - This parameter is typically used when **the total number of Transformer layers is not divisible by the pipeline parallelism (PP) size**, or when the first pipeline stage (PP stage 0) of a multimodal model consumes excessive GPU memory.
 - 🔥decoder_last_pipeline_num_layers: The number of Transformer layers in the last pipeline stage of the decoder. Default is None, which means the Transformer layers are evenly distributed across all pipeline stages.
-- account_for_embedding_in_pipeline_split: If set to `True`, the input embedding layer will be treated as a standard Transformer layer in the context of partitioning and placement for pipeline parallelism. The default is `False`.
-- account_for_loss_in_pipeline_split: If set to `True`, the loss layer will be treated as a standard Transformer layer in the context of partitioning and placement for pipeline parallelism. The default is `False`.
 - overlap_p2p_comm: Overlap pipeline parallel communication with forward and backward blocks in 1F1B. Defaults to True.
 - align_param_gather: When set to True, all PP stages will launch parameter all-gather operations simultaneously. Otherwise, each PP stage will launch independently as needed. Defaults to True.
 - 🔥sequence_parallel: Enables sequence parallel optimization; this option takes effect only when `tensor_model_parallel_size` is set. Default is False.
@@ -220,6 +218,7 @@ For guidance on selecting parallelization strategies, please refer to the [Train
 **MTP Parameters**
 - mtp_num_layers: Number of Multi-Token Prediction (MTP) layers. MTP extends the prediction scope at each position to multiple future tokens. This MTP implementation uses D sequential modules to sequentially predict D additional tokens. Default is None. (requires "megatron-core>=0.14")
   - Note: The value of mtp_num_layers will not be automatically retrieved from config.json and must be set manually. You can refer to the `num_nextn_predict_layers` field in config.json to fill in this value. When using mcore-bridge, MTP weights will be loaded from safetensors files first. If not found, random initialization will be performed. (To use blockwise fp8 + mtp, please use mcore>=0.15)
+  - Multimodal MTP support: Requires installing "mcore-bridge>=1.1.0".
 - mtp_loss_scaling_factor: Scaling factor of Multi-Token Prediction (MTP) loss. We compute the average of MTP losses across all depths, then multiply it by this scaling factor to obtain the overall MTP loss, which serves as an additional training objective. Default is 0.1.
 
 **Tuner Parameters**:
@@ -271,11 +270,11 @@ LoRA Training:
 
 **Multimodal Parameters**:
 - vit_gradient_checkpointing: Whether to enable gradient checkpointing for the ViT (Vision Transformer) component during multimodal model training. Defaults to `True`. (**The ViT implementation in Megatron-SWIFT uses the Hugging Face `transformers` library.**)
-- attn_impl: When training a multimodal model, sets the `attn_impl` implementation used for the ViT part. Defaults to `'flash_attn'`.
+- vit_gradient_checkpointing_kwargs: Arguments passed to `torch.utils.checkpoint`. For example: set `--vit_gradient_checkpointing_kwargs '{"use_reentrant": false}'`. Defaults to `None`. This parameter only takes effect when `vit_gradient_checkpointing` is enabled.
+- vit_attn_impl: When training a multimodal model, sets the `attn_impl` implementation used for the ViT part. Defaults to `'flash_attn'`.
 - vit_lr: Specifies the learning rate for the ViT module when training multimodal models. Default is `None`, same as `learning_rate`. Typically used together with `--freeze_vit` and `--freeze_aligner`.
   - Note: The "learning rate" printed in the logs is the learning rate of the LLM.
 - aligner_lr: Specifies the learning rate for the aligner module in multimodal models. Default is `None`, same as `learning_rate`.
-- gradient_checkpointing_kwargs: Arguments passed to `torch.utils.checkpoint`. For example: set `--gradient_checkpointing_kwargs '{"use_reentrant": false}'`. Defaults to `None`. This parameter only takes effect when `vit_gradient_checkpointing` is enabled.
 
 
 **Other Parameters**:
@@ -395,6 +394,7 @@ In addition to inheriting the training parameters, the following parameters are 
 - rollout_importance_sampling_threshold: Threshold for importance sampling weights, used for truncating or masking extreme weights. Default is 2.0.
 - log_rollout_offpolicy_metrics: Whether to log training-inference mismatch diagnostic metrics (KL, PPL, χ², etc.) when `rollout_importance_sampling_mode` is not set. When `rollout_importance_sampling_mode` is set, metrics are always logged. Default is False.
 - off_policy_sequence_mask_delta: Off-Policy Sequence Masking threshold from [DeepSeek-V3.2 paper](https://arxiv.org/abs/2512.02556). When set, computes `mean(old_policy_logps - policy_logps)` for each sequence. If this value exceeds the threshold AND the sequence has negative advantage, the sequence is masked out from loss computation. For details, refer to the [documentation](../Instruction/GRPO/AdvancedResearch/training_inference_mismatch.md#off-policy-sequence-masking).
+- router_replay_mode: Router replay mode. Options are `disabled`,`R2`,`R3`. Default is disabled.
 
 Built-in reward function parameters refer to the [documentation](../Instruction/Command-line-parameters.md#reward-function-parameters).
 

@@ -10,6 +10,7 @@ import torch.nn
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, nullcontext
 from functools import partial
+from mcore_bridge import LoraParallelLinear
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
@@ -26,8 +27,7 @@ from typing import Callable, Dict, List, Optional
 from swift.dataset import RowPreprocessor
 from swift.megatron.callbacks import megatron_callbacks_map
 from swift.megatron.model import get_mcore_model
-from swift.megatron.tuners import LoraParallelLinear
-from swift.megatron.utils import (copy_original_module_weight, disable_forward_pre_hook, enable_forward_pre_hook,
+from swift.megatron.utils import (apply_router_replay_patch, disable_forward_pre_hook, enable_forward_pre_hook,
                                   get_optimizer_param_scheduler, get_padding_to, init_persistent_async_worker,
                                   initialize_tp_communicators, load_mcore_checkpoint,
                                   logical_and_across_model_parallel_group, maybe_finalize_async_save,
@@ -44,8 +44,11 @@ from .utils import (TrainerState, build_streaming_dataloader, get_batch_on_this_
 
 try:
     from megatron.core.optimizer import param_group_identifier_keys
+    from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 except ImportError:
     param_group_identifier_keys = None
+    RouterReplay = None
+    RouterReplayAction = None
 
 mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
 
@@ -55,10 +58,20 @@ logger = get_logger()
 class BaseMegatronTrainer(ABC):
 
     def __init__(self, args, template: Template):
+        # validate mcore version and patch routing_replay
+        self.enable_routing_replay = args.router_replay_mode != 'disabled'
+        if self.enable_routing_replay:
+            apply_router_replay_patch()
+
         self.args = args
         self.template = template
         self.prepare_model()
-        self.config = self.unwrapped_models[0].config
+        # Sync template.padding_free after prepare_model(), because _check_padding_free
+        # may override args.padding_free for certain models (e.g. DSA attention).
+        if template.padding_free != args.padding_free:
+            logger.warning(f'template.padding_free({template.padding_free}) != args.padding_free({args.padding_free}), '
+                           f'syncing template.padding_free to {args.padding_free}.')
+            template.padding_free = args.padding_free
         self.optimizer, self.opt_param_scheduler = self.get_optimizer_and_scheduler()
         self.data_collator = self._get_data_collator()
 
@@ -67,9 +80,6 @@ class BaseMegatronTrainer(ABC):
         if initialize_embedding:
             for m in self.unwrapped_models:
                 self._initialize_embedding(m)
-        if args.tuner_type != 'full' and args.modules_to_save:
-            for m in self.unwrapped_models:
-                copy_original_module_weight(m)
         self._load_checkpoint()
 
         self.eval_metrics = None
@@ -177,9 +187,9 @@ class BaseMegatronTrainer(ABC):
 
     def prepare_model(self):
         args = self.args
-        self.wrapped_models = []
         self.unwrapped_models = get_mcore_model(args, self.template.config)
-        self.bridge = args.megatron_model_meta.bridge_cls(args)
+        self.config = self.unwrapped_models[0].config
+        self.bridge = self.config.bridge
         self.peft_models = self._prepare_peft_model(self.unwrapped_models)
         self.wrapped_models = wrap_model(args, self.unwrapped_models)
 
@@ -190,7 +200,7 @@ class BaseMegatronTrainer(ABC):
         peft_models = [prepare_mcore_model(args, model) for model in models]
         if args.tuner_type == 'lora' and args.adapters and args.mcore_adapter is None:
             assert len(args.adapters) == 1, 'Currently only support one adapter.'
-            self.bridge.load_weights(models, args.adapters[0], is_peft_format=True, adapter_name='default')
+            self.bridge.load_weights(models, args.adapters[0], peft_format=True, adapter_name='default')
         return peft_models
 
     def get_optimizer_and_scheduler(self):
@@ -492,7 +502,7 @@ class BaseMegatronTrainer(ABC):
             if self.args.vit_gradient_checkpointing:
                 dynamic_gradient_checkpointing(module, False)
                 try:
-                    module.gradient_checkpointing_enable(**(self.args.gradient_checkpointing_kwargs or {}))
+                    module.gradient_checkpointing_enable(**(self.args.vit_gradient_checkpointing_kwargs or {}))
                     module.enable_input_require_grads()
                 except AttributeError:
                     pass
@@ -719,7 +729,7 @@ class BaseMegatronTrainer(ABC):
             self.optimizer,
             self.opt_param_scheduler,
             iteration=iteration,
-            is_peft_format=args.tuner_type == 'lora',
+            peft_format=args.tuner_type == 'lora',
             output_dir=output_dir)
         state.last_model_checkpoint = output_dir
         if state.best_global_step:
@@ -745,9 +755,10 @@ class BaseMegatronTrainer(ABC):
             self.bridge.save_weights(
                 self.unwrapped_models,
                 output_dir,
-                is_peft_format=save_peft_format,
+                peft_format=save_peft_format,
+                args=args,
                 processor=self.template.processor,
-                hf_config=self.template.config)
+            )
             if args.tuner_type != 'full' and args.merge_lora:
                 self.unmerge_lora_adapters()
 
@@ -839,6 +850,10 @@ class BaseMegatronTrainer(ABC):
         self.optimizer.zero_grad()
         # TODO: refactor _replace_data_iterator
         data_iterator = self._replace_data_iterator(train_data_iterator)
+
+        if self.enable_routing_replay:
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
         metrics = forward_backward_func(
             forward_step_func=self.forward_step,
             data_iterator=data_iterator,
@@ -854,6 +869,10 @@ class BaseMegatronTrainer(ABC):
         grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
         if update_successful:
             self.opt_param_scheduler.step(increment=args.global_batch_size)
+
+        if self.enable_routing_replay:
+            RouterReplay.clear_global_router_replay_action()
+            RouterReplay.clear_global_indices()
 
         return metrics, grad_norm, update_successful
 
