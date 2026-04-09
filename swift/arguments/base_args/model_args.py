@@ -63,6 +63,10 @@ class ModelArguments:
         init_strategy (Optional[str]): The strategy to initialize all uninitialized parameters when loading a model
             (especially for custom architectures). Options include 'zero', 'uniform', 'normal', 'xavier_uniform',
             'xavier_normal', 'kaiming_uniform', 'kaiming_normal', 'orthogonal'. Defaults to None.
+        mini_batch_size (int): Number of chunks to process in each mini-batch when compressing
+            document chunks through ``memory_model``.  Lower values reduce peak GPU memory at the
+            cost of more sequential forward passes.  ``0`` means all chunks in one forward pass.
+            Defaults to ``0``.
     """
     model: Optional[str] = None  # model id or model path
     model_type: Optional[str] = field(
@@ -89,6 +93,7 @@ class ModelArguments:
     local_repo_path: Optional[str] = None
     init_strategy: Literal['zero', 'uniform', 'normal', 'xavier_uniform', 'xavier_normal', 'kaiming_uniform',
                            'kaiming_normal', 'orthogonal'] = None
+    mini_batch_size: int = 0
 
     def _init_device_map(self):
         """Prepare device map args"""
@@ -243,4 +248,5 @@ class ModelArguments:
             'num_labels': self.num_labels,
             'problem_type': self.problem_type,
             'init_strategy': self.init_strategy,
+            'mini_batch_size': self.mini_batch_size,
         }

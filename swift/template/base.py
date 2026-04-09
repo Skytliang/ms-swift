@@ -94,6 +94,7 @@ class Template(ProcessorMixin):
         response_prefix: Optional[str] = None,
         enable_thinking: Optional[bool] = None,
         add_non_thinking_prefix: bool = True,
+        max_chunk_length: int = 0,
     ) -> None:
         """
         default_system: Override the default_system in the template.
@@ -109,6 +110,7 @@ class Template(ProcessorMixin):
         self._processor_inited = False
         self._version = 'v6'  # Avoid compatibility issues caused by load_from_cache_file caching.
         self.max_length = max_length
+        self.max_chunk_length = max_chunk_length
         self.model = None
         self.dummy_model = None
 

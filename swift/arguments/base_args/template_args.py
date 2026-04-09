@@ -109,6 +109,9 @@ class TemplateArguments:
             Note: During training, if the basic strategy of loss_scale is last_round, this modification is only
             applied to the last round; otherwise, for example 'default' or 'all', this modification is applied to
             every round of data. If set to False, no non-thinking prefix is added to data samples.
+        max_chunk_length (int): Maximum allowed token length for a single chunk text. Samples
+            containing any chunk longer than this limit are skipped during training.
+            ``0`` means no limit.  Defaults to ``0``.
 
 
     """
@@ -133,6 +136,7 @@ class TemplateArguments:
     response_prefix: Optional[str] = None
     enable_thinking: Optional[bool] = None
     add_non_thinking_prefix: bool = True
+    max_chunk_length: int = 0
 
     def __post_init__(self):
         if getattr(self, 'model_meta', None) is not None:
@@ -181,4 +185,5 @@ class TemplateArguments:
             'response_prefix': self.response_prefix,
             'enable_thinking': self.enable_thinking,
             'add_non_thinking_prefix': self.add_non_thinking_prefix,
+            'max_chunk_length': self.max_chunk_length,
         }

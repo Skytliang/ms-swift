@@ -208,6 +208,11 @@ class TunerArguments:
             self.target_modules = self.target_regex
 
     def _init_multimodal_full(self):
+        # Freeze memory_model for MemQwen3 (works for non-multimodal models too)
+        if self.freeze_memory_model:
+            self.freeze_parameters += ['memory_model']
+            logger.info('freeze_memory_model is enabled, adding memory_model to freeze_parameters')
+
         model_arch = self.model_meta.model_arch
         if not self.model_meta.is_multimodal or not model_arch or self.tuner_type != 'full':
             return

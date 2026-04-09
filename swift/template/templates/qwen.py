@@ -12,7 +12,7 @@ from transformers.integrations import is_deepspeed_zero3_enabled
 from typing import Any, Dict, List, Literal, Optional
 
 from swift.utils import get_env_args, get_packed_seq_params, is_deepspeed_enabled, to_float_dtype
-from ..base import Template
+from ..base import MaxLengthError, Template
 from ..constant import LLMTemplateType, MLLMTemplateType
 from ..register import register_template
 from ..template_inputs import StdTemplateInputs
@@ -94,6 +94,7 @@ class MemQwen3Template(Template):
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = Template._encode(self, inputs)
         if not inputs.chunks:
+            # raise ValueError('No chunks found in inputs')
             return encoded
 
         tokenizer = self.tokenizer
@@ -112,6 +113,15 @@ class MemQwen3Template(Template):
             for text in inputs.chunks
         ]
         num_chunks = len(chunk_token_lists)
+
+        # ── filter out samples with excessively long chunks ─────────────
+        max_chunk_length: int = self.max_chunk_length
+        if max_chunk_length > 0:
+            longest = max(len(ids) for ids in chunk_token_lists)
+            if longest > max_chunk_length:
+                raise MaxLengthError(
+                    f'Chunk length {longest} exceeds max_chunk_length {max_chunk_length}, skipping sample.'
+                )
 
         # ── expand pad-id placeholders → memory_vocab_size slots each ─────
         input_ids: List[int] = encoded['input_ids']

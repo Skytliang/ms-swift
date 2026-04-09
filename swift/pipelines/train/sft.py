@@ -49,6 +49,9 @@ class SwiftSft(SwiftPipeline, TunerMixin):
     def _prepare_model_tokenizer(self, **kwargs):
         args = self.args
         self.model, self.processor = args.get_model_processor(**kwargs)
+        # Pass mini_batch_size to model.config so the model can read it during forward.
+        if self.model is not None and hasattr(self.model, 'config') and hasattr(args, 'mini_batch_size'):
+            self.model.config.mini_batch_size = args.mini_batch_size
         if args.sequence_parallel_size > 1:
             sequence_parallel.prepare(
                 args.sequence_parallel_size, model=self.model, tokenizer=self.processor, padding_free=args.padding_free)

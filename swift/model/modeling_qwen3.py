@@ -615,13 +615,16 @@ class MemQwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         chunk_input_ids: torch.Tensor,        # (NC, C)
         chunk_attention_mask: torch.Tensor,   # (NC, C)
         chunk_memory_mask: torch.Tensor,      # (NC, C) bool, True = mem_slot position
+        mini_batch_size: int = 0,
     ) -> torch.Tensor:
         """
         Compress token-id sequences chunk-by-chunk using memory_model.
 
         ``chunk_input_ids`` shape is ``(NC, C)`` where NC is the number of chunks
-        and C = text_len + 1 (sep) + M (mem_slots).  NC is used directly as the
-        batch dimension of memory_model — no extra reshape needed.
+        and C = text_len + 1 (sep) + M (mem_slots).
+
+        To avoid OOM when NC is large, chunks are processed in mini-batches of
+        ``mini_batch_size``.  ``0`` (default) means all chunks in one forward pass.
 
         ``chunk_memory_mask`` is produced by the template and marks exactly the
         M memory-slot positions per chunk — no dynamic index computation needed.
@@ -631,22 +634,32 @@ class MemQwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         """
         NC, C = chunk_input_ids.shape
         M = self.memory_vocab_size
+        # mini_batch_size <= 0 means process all chunks in one forward pass
+        if mini_batch_size <= 0:
+            mini_batch_size = NC
 
-        # ── memory_model forward (embed + transformer in one call) ────────
-        outputs = self.memory_model(
-            input_ids=chunk_input_ids,
-            attention_mask=chunk_attention_mask,
-        )
-        last_hidden = outputs.last_hidden_state                      # (NC, C, H)
-        H = last_hidden.shape[-1]
+        compressed_parts: list[torch.Tensor] = []
+        for start in range(0, NC, mini_batch_size):
+            end = min(start + mini_batch_size, NC)
+            batch_ids = chunk_input_ids[start:end]              # (bs, C)
+            batch_mask = chunk_attention_mask[start:end]         # (bs, C)
+            batch_mem_mask = chunk_memory_mask[start:end]        # (bs, C)
 
-        # ── select mem-slot hidden states using chunk_memory_mask ─────────
-        # chunk_memory_mask is True at exactly the M mem-slot positions per chunk.
-        # last_hidden[chunk_memory_mask] gives a flat (NC*M, H) tensor;
-        # reshape to (NC, M, H) then flatten to (1, NC*M, H).
-        compressed = last_hidden[chunk_memory_mask.to(last_hidden.device)].reshape(NC, M, H)  # (NC, M, H)
-        compressed = compressed.reshape(1, NC * M, H)                  # (1, NC*M, H)
-        return compressed.to(dtype=last_hidden.dtype)
+            outputs = self.memory_model(
+                input_ids=batch_ids,
+                attention_mask=batch_mask,
+            )
+            last_hidden = outputs.last_hidden_state              # (bs, C, H)
+            H = last_hidden.shape[-1]
+            bs = end - start
+
+            # select mem-slot hidden states
+            selected = last_hidden[batch_mem_mask]  # (bs*M, H)
+            compressed_parts.append(selected.reshape(bs, M, H))
+
+        compressed = torch.cat(compressed_parts, dim=0)          # (NC, M, H)
+        compressed = compressed.reshape(1, NC * M, compressed.shape[-1])  # (1, NC*M, H)
+        return compressed
 
     # ------------------------------------------------------------------
     # Inject compressed doc embeddings at memory-token placeholder positions
@@ -654,36 +667,20 @@ class MemQwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     def _inject_memory_embeddings(
         self,
-        input_ids: torch.LongTensor,                        # (1, S)
+        inputs_embeds: torch.Tensor,                        # (B, S, H)  — already embedded by caller
         memory_mask: torch.BoolTensor,                      # (1, S)
-        chunk_input_ids: torch.LongTensor,                  # (NC, C)
-        chunk_attention_mask: torch.Tensor | None = None,   # (NC, C)
-        chunk_memory_mask: torch.BoolTensor | None = None,  # (NC, C) True = mem_slot
+        compressed: torch.Tensor,                           # (1, NC*M, H)
     ) -> torch.Tensor:
         """
         Replace every memory-slot position (marked by ``memory_mask``) in
-        ``input_ids`` with the compressed representation of ``chunk_input_ids``.
-
-        ``memory_mask`` is produced by the template's ``_encode`` and padded by
-        the collator — no ``memory_token_id`` comparison needed here.
+        ``inputs_embeds`` with the pre-compressed representations.
 
         Returns:
             inputs_embeds: ``(B, S, H)``
         """
-        embed_layer = self.model.embed_tokens
-
-        # 1. Build base embeddings; memory-slot positions hold pad → harmless
-        inputs_embeds = embed_layer(input_ids)                             # (B, S, H)
-
-        # 2. Compress chunks using memory_model
-        compressed = self._compress_chunk_embeds(
-            chunk_input_ids, chunk_attention_mask, chunk_memory_mask
-        )                                                                  # (1, NC*M, H)
-
-        # 3. Scatter into memory-slot positions via masked_scatter
-        scatter_mask  = memory_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        scatter_mask = memory_mask.unsqueeze(-1).expand_as(inputs_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(
-            scatter_mask, compressed.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            scatter_mask, compressed.to(dtype=inputs_embeds.dtype)
         )
         return inputs_embeds
 
@@ -741,9 +738,29 @@ class MemQwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         if (memory_mask is not None and chunk_input_ids is not None
                 and input_ids is not None
                 and input_ids.shape[1] == memory_mask.shape[1]):
+            # 1. Embed input_ids with the main model's embed_tokens (always in grad graph)
+            inputs_embeds = self.model.embed_tokens(input_ids)  # (B, S, H)
+
+            # 2. Compress chunks via memory_model (no_grad only around memory_model if frozen)
+            _mem_frozen = not any(p.requires_grad for p in self.memory_model.parameters())
+            if _mem_frozen:
+                if self.memory_model.training:
+                    self.memory_model.eval()
+                with torch.no_grad():
+                    compressed = self._compress_chunk_embeds(
+                        chunk_input_ids, chunk_attention_mask, chunk_memory_mask,
+                        mini_batch_size=getattr(self.config, 'mini_batch_size', 0),
+                    )
+                compressed = compressed.detach()
+            else:
+                compressed = self._compress_chunk_embeds(
+                    chunk_input_ids, chunk_attention_mask, chunk_memory_mask,
+                    mini_batch_size=getattr(self.config, 'mini_batch_size', 0),
+                )
+
+            # 3. Scatter compressed embeddings into memory-slot positions
             inputs_embeds = self._inject_memory_embeddings(
-                input_ids, memory_mask, chunk_input_ids,
-                chunk_attention_mask, chunk_memory_mask
+                inputs_embeds, memory_mask, compressed
             )
             input_ids = None
 
